@@ -267,6 +267,7 @@ class UserEncoder_MINM(nn.Module):
         self.batch_size_ = args.batch_size
         self.maxlen = args.maxlen
         self.util_reg = args.util_reg
+        self.din = args.din
         self.mimn = mimn_torch.MIMNCell(args.controller_units, args.memory_size, args.memory_vector_dim, args.read_head_num, args.write_head_num, self.newssize,
                  output_dim=None, clip_value=20, shift_range=1, batch_size=args.batch_size, util_reg=self.util_reg, sharp_value=2.)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -322,17 +323,66 @@ class UserEncoder_MINM(nn.Module):
 
         # self.mimn_o = torch.stack(self.mimn_o, dim=1)
         self.state_list.append(state)
-        # mean_memory = torch.mean(state['sum_aggre'], dim=-2)
+        mean_memory = torch.mean(state['sum_aggre'], dim=-2)
 
         before_aggre = state['w_aggre']
         M = state['M']
-        user_embed = torch.mean(M, 1)
-        # user_embed = mean_memory
+        # user_embed = torch.mean(M, 1)
         if self.util_reg:
             reg_loss = self.mimn.capacity_loss(before_aggre)
-            return [user_embed, reg_loss]
-        return [user_embed]
+            return [M, reg_loss]
+        return [M]
 
+class DIN(nn.Module):
+    def __init__(self, args):
+        super(DIN, self).__init__()
+        self.facts_size = args.memory_vector_dim * 4
+        self.dense1 = nn.Linear(self.facts_size, 80)
+        self.dense2 = nn.Linear(80, 40)
+        self.dense3 = nn.Linear(40, 1)
+    def forward(self, query, facts, mask=None, stag='null', mode='SUM', softmax_stag=1, time_major=False,
+                  return_alphas=False):
+        query_seq_len = query.shape[1]
+        facts_seq_len = facts.shape[1]
+        facts_origin = facts
+        query_origin = query
+        queries = query.repeat([1, 1, facts.shape[1]])
+        facts = facts.repeat([1, queries.shape[1], 1])
+        queries = torch.reshape(queries, facts.size())
+
+        din_all = torch.cat([queries, facts, queries - facts, queries * facts], dim=-1)
+        d_layer_1_all = self.dense1(din_all)
+        d_layer_1_all = nn.Sigmoid()(d_layer_1_all)
+        d_layer_2_all = self.dense2(d_layer_1_all)
+        d_layer_2_all = nn.Sigmoid()(d_layer_2_all)
+        d_layer_3_all = self.dense3(d_layer_2_all)
+        d_layer_3_all = torch.reshape(d_layer_3_all, [-1, query_seq_len, facts_seq_len])
+        scores = d_layer_3_all
+
+        if mask is not None:
+            mask = torch.eq(mask, torch.ones_like(mask))
+            key_masks = torch.unsqueeze(mask, 1)  # [B, can, m]
+            paddings = torch.ones_like(scores) * (-2 ** 32 + 1)
+            scores = torch.where(key_masks, scores, paddings)  # [B, can, m]
+
+        # Activation
+        if softmax_stag:
+            scores = nn.Softmax(dim=-1)(scores)  # [B, can, m]
+
+        # Weighted sum
+        if mode == 'SUM':
+            output = torch.matmul(scores, facts_origin)  # [B, can, d]
+            output = torch.sum(query_origin * output, dim=-1)
+            # output = tf.reshape(output, [-1, tf.shape(facts)[-1]])
+        else:
+            scores = torch.reshape(scores, [-1, facts.shape[1]])
+            output = facts * torch.unsqueeze(scores, -1)
+            output = torch.reshape(output, facts.size())
+
+        if return_alphas:
+            return output, scores
+
+        return output
 
 
 class Nrms(nn.Module):
@@ -342,21 +392,22 @@ class Nrms(nn.Module):
         self.userencoder = UserEncoder_MINM(self.newsencoder, args)
         self.criterion = nn.CrossEntropyLoss()
         self.util_reg = args.util_reg
+        self.din_flag = args.din
+        self.din = DIN(args)
 
     def forward(self, candidate_news, clicked_news, click_len, labels=None, train_test=0):
         reshape_candidate_news = candidate_news.view(-1, candidate_news.size(-1))
         reshape_news_embed = self.newsencoder(reshape_candidate_news)
         news_embed = reshape_news_embed.view(candidate_news.size(0), -1, reshape_news_embed.size(-1))
         result_list = self.userencoder([clicked_news, click_len], train_test)
-        user_embed = result_list[0]
-        # print(user_embed.shape)
-        # print(user_embed)
-        user_embed = torch.unsqueeze(user_embed, 2)
-        # print(user_embed.shape)
-        # print(user_embed)
-        score = torch.squeeze(torch.matmul(news_embed, user_embed))
-        # print(score.shape)
-        # print(score)
+        M = result_list[0]
+        if self.din_flag:
+            score = self.din(news_embed, M, mask=None)
+        else:
+            user_embed = torch.mean(M, 1)
+            user_embed = torch.unsqueeze(user_embed, 2)
+            score = torch.squeeze(torch.matmul(news_embed, user_embed))
+
         if labels is not None:
             # print(labels)
             loss = self.criterion(score, labels)
@@ -487,7 +538,7 @@ class Model(nn.Module):
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-g', '--gpu', help='set gpu device number 0-3', type=str, default='1')
+    parser.add_argument('-g', '--gpu', help='set gpu device number 0-3', type=str, default='2')
     parser.add_argument('--note', help='model-note', type=str, default='None')
     parser.add_argument('--foldname', type=str, default='nrms')
     parser.add_argument('--test', help='test per epoch', type=int, default=1)
@@ -507,15 +558,16 @@ def parse_args():
     parser.add_argument('--body_size', type=int, default=60)
     parser.add_argument('--cata_size', type=int, default=1)
     parser.add_argument('--author_size', type=int, default=1)
-    parser.add_argument('--his_size', type=int, default=100)
+    parser.add_argument('--his_size', type=int, default=50)
     parser.add_argument('--w2v', type=int, default=0)
     parser.add_argument('--controller_units', type=int, default=50)
-    parser.add_argument('--memory_size', type=int, default=8)
+    parser.add_argument('--memory_size', type=int, default=5)
     parser.add_argument('--memory_vector_dim', type=int, default=50)
     parser.add_argument('--read_head_num', type=int, default=1)
     parser.add_argument('--write_head_num', type=int, default=1)
-    parser.add_argument('--maxlen', type=int, default=100)
-    parser.add_argument('--util_reg', type=int, default=False)
+    parser.add_argument('--maxlen', type=int, default=50)
+    parser.add_argument('--util_reg', type=bool, default=False)
+    parser.add_argument('--din', type=bool, default=True)
     parser.add_argument('--mask', type=bool, default=True)
     parser.add_argument('--medialayer', type=int, default=25)
     parser.add_argument('--max_grad_norm', type=int, default=0)
@@ -560,7 +612,7 @@ class MyDataset():
         self.author_dict = news_file['author_dict'].tolist()
         self.news_features = news_file['news_features'].tolist()
 
-        train_test_data = np.load('train_test_data_4.11_his100.npz', allow_pickle=True)
+        train_test_data = np.load('train_test_data_4.11_his50.npz', allow_pickle=True)
         self.negnums = train_test_data['negnums'].tolist()
         self.train_user_his = train_test_data['train_user_his'].tolist()
         self.train_candidate = train_test_data['train_candidate'].tolist()
