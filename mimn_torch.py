@@ -72,7 +72,7 @@ class MIMNCell(nn.Module):
             beta = (nn.Softplus()(head_parameter[:, self.memory_vector_dim]) + 1) * self.sharp_value
             w = self.addressing(k, beta, key_M, prev_M)
             if self.util_reg and i == 1:
-                s = nn.Softmax()(head_parameter[:, self.memory_vector_dim + 2:self.memory_vector_dim + 2 + (self.shift_range * 2 + 1)])
+                s = nn.Softmax(dim=-1)(head_parameter[:, self.memory_vector_dim + 2:self.memory_vector_dim + 2 + (self.shift_range * 2 + 1)])
                 gamma = 2*(nn.Softplus()(head_parameter[:, -1]) + 1)*self.sharp_value
                 w = self.capacity_overflow(w, s, gamma)
                 write_weight.append(self.capacity_overflow(w.detach(), s, gamma))
@@ -165,7 +165,7 @@ class MIMNCell(nn.Module):
         read_vector_list = [self.expand(nn.Tanh()(self.read_vector_list_one), dim=0, N=batch_size)
                             for i in range(self.read_head_num)]
 
-        w_list = [self.expand(nn.Softmax()(self.w_list_one), dim=0, N=batch_size)
+        w_list = [self.expand(nn.Softmax(dim=-1)(self.w_list_one), dim=0, N=batch_size)
                   for i in range(self.read_head_num + self.write_head_num)]
 
         controller_init_state = self.controller_init_state_train
