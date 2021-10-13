@@ -402,7 +402,7 @@ class Nrms(nn.Module):
         result_list = self.userencoder([clicked_news, click_len], train_test)
         M = result_list[0]
         if self.din_flag:
-            score = self.din(news_embed, M, mask=None)
+            score = torch.squeeze(self.din(news_embed, M, mask=None))
         else:
             user_embed = torch.mean(M, 1)
             user_embed = torch.unsqueeze(user_embed, 2)
