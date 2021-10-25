@@ -262,6 +262,7 @@ class UserEncoder_MINM(nn.Module):
         self.dropout2 = nn.Dropout(args.droprate)
         self.newssize = args.word_embed_size
         self.newsencoder = newsencoder
+        self.multiatt = MultiHeadAttention(2, 25, 50)
         self.his_size = args.his_size
         self.mask = args.mask
         self.batch_size_ = args.batch_size
@@ -290,7 +291,12 @@ class UserEncoder_MINM(nn.Module):
 
         mask = torch.arange(0, self.his_size).to(self.device).unsqueeze(0).expand(user_click.size(0), self.his_size).lt(
             seq_len.unsqueeze(1)).float()
-        # mask = mask.masked_fill(mask == 0, -1e9)
+        mask_att = mask
+        mask_att = mask_att.masked_fill(mask_att == 0, -1e9)
+        mask1 = torch.unsqueeze(torch.unsqueeze(mask_att, 1), 1)
+        click_embed = self.multiatt(click_embed, mask1)
+        click_embed = self.dropout2(click_embed)
+
         if train_test == 0:
             bz = self.batch_size_
             state = self.mimn.zero_state(bz)
@@ -431,6 +437,7 @@ class Model(nn.Module):
 
     def mtrain(self):
         args = self.args
+        # self.infer()
         # train_sampler = RandomSampler(train_dataset)
         # train_dataloader = DataLoader(train_dataset,
         #                               sampler=train_sampler,
@@ -521,7 +528,6 @@ class Model(nn.Module):
                 else:
                     click_probability = self.model(news, user_click, click_len, train_test=2)
             predict.append(click_probability.cpu().numpy())
-
         return predict
 
     def getscore(self, preds, labels):
@@ -567,7 +573,7 @@ def parse_args():
     parser.add_argument('--write_head_num', type=int, default=1)
     parser.add_argument('--maxlen', type=int, default=50)
     parser.add_argument('--util_reg', type=bool, default=False)
-    parser.add_argument('--din', type=bool, default=True)
+    parser.add_argument('--din', type=bool, default=False)
     parser.add_argument('--mask', type=bool, default=True)
     parser.add_argument('--medialayer', type=int, default=25)
     parser.add_argument('--max_grad_norm', type=int, default=0)
